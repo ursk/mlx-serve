@@ -1135,7 +1135,10 @@ pub const HotPrefixCache = struct {
             // construction (the flush refuses entries with media). The cap is
             // load-bearing even when tokens match past it: a restored row at a
             // placeholder must come from the vision splice, never from disk.
-            const disk_limit: u32 = @intCast(@min(firstSpanStart(media) orelse prompt_ids.len, prompt_ids.len));
+            // A hybrid restore needs a token left to forward, and an end-of-generation
+            // checkpoint can sit at the full prompt length (the RAM path clamps the same way).
+            const hybrid_cap = if (target_ssm_entries != null) prompt_ids.len -| 1 else prompt_ids.len;
+            const disk_limit: u32 = @intCast(@min(firstSpanStart(media) orelse prompt_ids.len, hybrid_cap));
             const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
                 // dead in a live post-mortem (2026-09-07): nothing in the
@@ -4025,6 +4028,54 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm3[0].conv_state, 0, s));
         try testing.expectEqual(@as(f32, 500.0), pcSsmVal(ssm3[0].ssm_state, 0, s));
     }
+}
+
+test "HotPrefixCache: a hybrid SSD restore leaves a token to forward when a checkpoint ends the entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // An end-of-generation checkpoint sits at the entry's full length.
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-end", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 600);
+        var src256 = pcBuildHybrid(s, 100.0, 500.0);
+        defer pcFreeHybrid(&src256);
+        var src600 = pcBuildHybrid(s, 300.0, 700.0);
+        defer pcFreeHybrid(&src600);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
+        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src600, 600, s);
+        _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    // A verbatim re-send after a restart restores below the prompt's last token, like RAM.
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-end", 0, 128);
+    defer hc2.deinit();
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var ssm2 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm2);
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
+    try testing.expect(!res.full_match);
+    try testing.expectEqual(@as(usize, 256), res.matched);
+    try testing.expectEqual(@as(usize, 256), cache2.step);
+    try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm2[0].conv_state, 0, s));
 }
 
 test "HotPrefixCache: chunk-heavy hybrid flush still lands its SSM checkpoints" {
