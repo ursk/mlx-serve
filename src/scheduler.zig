@@ -5783,9 +5783,11 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
-/// Snapshot the live SSM state at the committed length so the next turn resumes after this
+/// Snapshot the SSM state at the committed length so the next turn resumes after this
 /// one's generated tail; prefill snapshots end SSM_SNAPSHOT_BACKOFF tokens before the prompt end.
 /// Exact there because every speculative round rolls the GDN state back before it returns.
+/// Serial decode has already forwarded a lookahead past the key, so its state comes from the
+/// one the Generator held before that forward (`Generator.heldSsmAt`).
 fn appendDecodeEndCheckpoint(
     slot: *Slot,
     gen: *Generator,
@@ -5796,11 +5798,17 @@ fn appendDecodeEndCheckpoint(
     const xfm = slot.model.transformer orelse return cps;
     const a = gen.ssm_checkpoint_alloc orelse return cps;
     const newest: ?usize = if (cps.len > 0) cps[cps.len - 1].pos else null;
-    if (!decodeEndCheckpointWanted(slot.full_prompt.len, total_len, slot.moe_seq_offset, newest, slot.media.len > 0)) {
-        if (slot.moe_seq_offset != total_len) log.debug("[hot-cache] decode-end checkpoint skipped: live position {d}, committed {d}\n", .{ slot.moe_seq_offset, total_len });
+    const held = if (slot.moe_seq_offset == total_len) null else gen.heldSsmAt(total_len);
+    const state_pos = if (held != null) total_len else slot.moe_seq_offset;
+    if (!decodeEndCheckpointWanted(slot.full_prompt.len, total_len, state_pos, newest, slot.media.len > 0)) {
+        if (state_pos != total_len) log.debug("[hot-cache] decode-end checkpoint skipped: live position {d}, committed {d}\n", .{ slot.moe_seq_offset, total_len });
         return cps;
     }
-    var cp = transformer_mod.captureSsmCheckpoint(a, entries, total_len, xfm.s) catch |err| {
+    const captured = if (held) |h|
+        checkpointFromHeld(a, entries, h, total_len, xfm.s)
+    else
+        transformer_mod.captureSsmCheckpoint(a, entries, total_len, xfm.s);
+    var cp = captured catch |err| {
         log.warn("[hot-cache] decode-end checkpoint failed: {s} — the next turn re-forwards this tail\n", .{@errorName(err)});
         return cps;
     };
@@ -5819,6 +5827,32 @@ fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usiz
     if (has_media or total_len <= prompt_len or live_pos != total_len) return false;
     if (newest_cp) |pos| return pos < total_len;
     return true;
+}
+
+/// Recurrent layers from the held state; QSA layers from the live entries, whose indexer
+/// history is a prefix buffer that still reads correctly at `pos`.
+fn checkpointFromHeld(
+    a: std.mem.Allocator,
+    ents: []const SSMCacheEntry,
+    held: []const transformer_mod.SSMCacheEntrySnapshot,
+    pos: usize,
+    s: mlx.mlx_stream,
+) !transformer_mod.SSMCheckpoint {
+    if (held.len != ents.len) return error.SsmCheckpointLayerMismatch;
+    const tmp = try a.alloc(SSMCacheEntry, ents.len);
+    defer a.free(tmp);
+    for (ents, held, 0..) |*e, *h, i| {
+        tmp[i] = e.*;
+        if (transformer_mod.ssmAuxIsQsaHistory(e)) continue;
+        tmp[i].group = null;
+        tmp[i].conv_state = h.conv_state;
+        tmp[i].ssm_state = h.ssm_state;
+        tmp[i].aux_state = h.aux_state;
+        tmp[i].initialized = h.initialized;
+        tmp[i].ple_prev = h.ple_prev;
+        tmp[i].ple_prev_valid = h.ple_prev_valid;
+    }
+    return transformer_mod.captureSsmCheckpoint(a, tmp, pos, s);
 }
 
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
@@ -8191,6 +8225,38 @@ test "all speculative blocks publish through one per-token accounting loop" {
     const final_assign = "slot.completion_tokens = gen.completion_tokens;";
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, final_assign));
     try testing.expect(std.mem.lastIndexOf(u8, body, shared_call).? < std.mem.indexOf(u8, body, final_assign).?);
+}
+
+test "checkpointFromHeld: recurrent layers from the held step, QSA history from the live entry" {
+    const s = mlx.gpuStream();
+    const shape = [_]c_int{ 1, 4, 8 };
+    var live = [_]SSMCacheEntry{
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = mlx.mlx_array_new(), .initialized = true },
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = mlx.mlx_array_new(), .qsa_ratio = 4 },
+    };
+    defer {
+        _ = mlx.mlx_array_free(live[0].ssm_state);
+        transformer_mod.ssmFreeQsaState(&live[1]);
+    }
+    try mlx.check(mlx.mlx_zeros(&live[0].ssm_state, &shape, 3, .float32, s));
+    try mlx.check(mlx.mlx_ones(&live[1].aux_state, &[_]c_int{ 1, 16, 8 }, 3, .float32, s));
+    var held = [_]transformer_mod.SSMCacheEntrySnapshot{
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = mlx.mlx_array_new(), .initialized = true },
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true },
+    };
+    defer _ = mlx.mlx_array_free(held[0].ssm_state);
+    try mlx.check(mlx.mlx_ones(&held[0].ssm_state, &shape, 3, .float32, s));
+
+    var cp = try checkpointFromHeld(testing.allocator, &live, &held, 12, s);
+    defer cp.deinit(testing.allocator);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_sum(&sum, cp.layers[0].ssm_state, false, s));
+    try mlx.check(mlx.mlx_array_eval(sum));
+    var v: f32 = -1;
+    try mlx.check(mlx.mlx_array_item_float32(&v, sum));
+    try testing.expectEqual(@as(f32, 32), v);
+    try testing.expectEqual(@as(c_int, 12), cp.layers[1].qsa_rows);
 }
 
 test "DFlash cache payload is committed only when it spans the trunk prefix" {

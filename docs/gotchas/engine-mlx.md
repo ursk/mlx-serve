@@ -5629,8 +5629,10 @@ Guard: `dflash: a load-time quantized linear no longer pins its bf16 source in t
   short there (its last row pairs with a token only the next prompt has), so the commit keeps
   that row's trunk hidden and the restore appends it (`specCarriesOneRow`); without it every
   such turn drafted blind. The SSD tier does not carry the hidden: a disk restore still does.
-  Only a turn that ends in speculative decode qualifies: serial decode keeps a forwarded
-  lookahead past the key (`live position 98, committed 96`), so it falls back as before.
+  Serial decode keeps a forwarded lookahead past the key (`live position 98, committed 96`),
+  so the Generator refcount-holds the per-step state before each serial forward
+  (`held_ssm`, two deep, tagged by position) and the commit builds the checkpoint from the
+  held state at the key (`checkpointFromHeld`; QSA layers read the live prefix history).
 - Guard: `scheduler.decode-end checkpoint: taken only where the live state is the committed
   prefix`, `prefix_cache.spec adoption: a decode-end restore one row past the history carries
   that row`; `tests/test_cache_reuses_generated_tokens.sh` with a hybrid `CACHE_GEN_TEST_MODEL`.
