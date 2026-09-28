@@ -87,6 +87,8 @@ def chat(messages, max_tokens=120):
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": False,
+        # Qwen3.6 drops reasoning before the last user turn by default, so turn 1 would re-render differently.
+        "chat_template_kwargs": {"preserve_thinking": True},
     }
     req = urllib.request.Request(
         f"{BASE}/v1/chat/completions",
