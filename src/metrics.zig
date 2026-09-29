@@ -76,6 +76,10 @@ pub const Metrics = struct {
     requests_cancelled_total: Counter,
     prefix_cache_queries_total: Counter,
     prefix_cache_hits_total: Counter,
+    /// Hybrid commits that got an SSM checkpoint at the end of the generated reply, and
+    /// those that could not (speculative decode, or no state at the reply's end).
+    prefix_cache_gen_end_checkpoints_total: Counter,
+    prefix_cache_gen_end_skipped_total: Counter,
 
     // Gauges (sampled by the background sampler thread; single writer)
     requests_running: Gauge,
@@ -141,6 +145,8 @@ pub const Metrics = struct {
             .requests_cancelled_total = Counter.init(),
             .prefix_cache_queries_total = Counter.init(),
             .prefix_cache_hits_total = Counter.init(),
+            .prefix_cache_gen_end_checkpoints_total = Counter.init(),
+            .prefix_cache_gen_end_skipped_total = Counter.init(),
             .requests_running = Gauge.init(),
             .requests_waiting = Gauge.init(),
             .gpu_utilization_pct = Gauge.init(),
@@ -343,7 +349,9 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             "\"requests_success_total\":{d}," ++
             "\"requests_cancelled_total\":{d}," ++
             "\"prefix_cache_queries_total\":{d}," ++
-            "\"prefix_cache_hits_total\":{d}" ++
+            "\"prefix_cache_hits_total\":{d}," ++
+            "\"prefix_cache_gen_end_checkpoints_total\":{d}," ++
+            "\"prefix_cache_gen_end_skipped_total\":{d}" ++
             "}},\"gauges\":{{" ++
             "\"requests_running\":{d}," ++
             "\"requests_waiting\":{d}," ++
@@ -369,6 +377,8 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             m.requests_cancelled_total.load(),
             m.prefix_cache_queries_total.load(),
             m.prefix_cache_hits_total.load(),
+            m.prefix_cache_gen_end_checkpoints_total.load(),
+            m.prefix_cache_gen_end_skipped_total.load(),
             m.requests_running.load(),
             m.requests_waiting.load(),
             m.gpu_utilization_pct.load(),

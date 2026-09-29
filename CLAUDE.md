@@ -349,6 +349,7 @@ Attention + KV:
 - **Hybrid-SSM prefix cache retains ~3.4× what it reports** (lever = ENTRY COUNT, `ramCappedPrefixCacheEntries`). SSM-checkpoint stride never sub-divides the chunk; dense hd-256 chunk cap 8192, MoE 4096.
 - **Hybrid prefix candidates rank by RESTORABLE SSM position** (`findBestRestorableMatch`). The always-on SSM snapshot sits `SSM_SNAPSHOT_BACKOFF` (30) tokens BEFORE prompt end.
 - **A restored tail inside the backoff window forwards as ONE span** (`ssmSnapshotBackoff(…, restored)`): same prompt warm == cold BYTES. Guard: `tests/test_hybrid_reuse_equivalence.sh`.
+- **A hybrid reply ENDS at an SSM checkpoint** (`appendGenerationEndCheckpoint`): a follow-up request that resends the reply matches it to the last token, and without one it restored at the prompt-end snapshot and re-prefilled the reply. The serial pipeline has already forwarded the stop token; its state at the reply's end comes from `Generator.held_ssm`. Guard: `tests/test_prefix_cache_gen_end.sh`.
 - **INT4 long-greedy divergence is legit**; byte-stable greedy ⇒ no spec + `--kv-quant off/8`. A prefix-cache HIT is not bit-identical on a HYBRID (≤0.047 nats) ⇒ `--prefix-cache-entries 0`.
 - **SSM/hybrid**: init checks `ssm_state.ctx == null`; param-free RMS norm passes `ones()`; Nemotron dt clip = only `time_step_limit`; PLD snapshots need per-FIELD null guards.
 - **A GDN trunk's `KVCache.step` is 0 forever**: batched rope offsets read the slot's `moe_seq_offset`, which the batched tick ADVANCES. Bar: `test_batched_equivalence.sh`.

@@ -5288,6 +5288,98 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
+/// An SSM checkpoint at the end of the reply, so the next turn restores past it instead of
+/// re-prefilling it. The batched tick's live state sits at `total_len`; the serial path has
+/// run past it, so its state comes from `Generator.heldSsmAt`. Speculative arms are skipped.
+fn appendGenerationEndCheckpoint(
+    m: ?*metrics_mod.Metrics,
+    slot: *Slot,
+    gen: *Generator,
+    hc: *prefix_cache_mod.HotPrefixCache,
+    cps_in: ?[]transformer_mod.SSMCheckpoint,
+    total_len: usize,
+    n_gen: usize,
+) ?[]transformer_mod.SSMCheckpoint {
+    if (!generate_mod.genEndCheckpointEnabled() or n_gen == 0) return cps_in;
+    const a = gen.ssm_checkpoint_alloc orelse return cps_in;
+    const ents = slot.ssm_entries orelse return cps_in;
+    const xf = slot.model.transformer orelse return cps_in;
+    if (gen.dflash_ctx != null or gen.mtp_cache != null) {
+        if (m) |mm| mm.prefix_cache_gen_end_skipped_total.inc();
+        return cps_in;
+    }
+    const old: []transformer_mod.SSMCheckpoint = cps_in orelse &.{};
+    if (old.len > 0 and old[old.len - 1].pos >= total_len) return cps_in;
+    const held = if (slot.moe_seq_offset == total_len) null else gen.heldSsmAt(total_len) orelse {
+        if (m) |mm| mm.prefix_cache_gen_end_skipped_total.inc();
+        log.debug("  [hot-cache] no end-of-generation checkpoint: state at {d}, entry {d}\n", .{ slot.moe_seq_offset, total_len });
+        return cps_in;
+    };
+    const captured = if (held) |h|
+        checkpointFromHeld(a, ents, h, total_len, xf.s)
+    else
+        transformer_mod.captureSsmCheckpoint(a, ents, total_len, xf.s);
+    var cp = captured catch |err| {
+        log.warn("[hot-cache] end-of-generation checkpoint failed: {s}\n", .{@errorName(err)});
+        return cps_in;
+    };
+    var out = a.alloc(transformer_mod.SSMCheckpoint, old.len + 1) catch {
+        cp.deinit(a);
+        return cps_in;
+    };
+    @memcpy(out[0..old.len], old);
+    out[old.len] = cp;
+    if (cps_in) |c| a.free(c);
+    // Over the cap: thin the interior, keeping the prompt-end checkpoint, where a turn
+    // whose match stops inside the reply resumes. The newest is never selected.
+    if (hc.ssm_checkpoint_max > 0 and out.len > hc.ssm_checkpoint_max) thin: {
+        const shrunk = a.alloc(transformer_mod.SSMCheckpoint, out.len - 1) catch break :thin;
+        const drop = transformer_mod.ssmCheckpointDropIndex(out, hc.cp_thin, if (old.len > 0) old.len - 1 else null);
+        out[drop].deinit(a);
+        @memcpy(shrunk[0..drop], out[0..drop]);
+        @memcpy(shrunk[drop..], out[drop + 1 ..]);
+        a.free(out);
+        out = shrunk;
+    }
+    // Copy mode attached the indexer history to the prompt-end checkpoint during prefill;
+    // move it to this one (share mode hands it over just after, in the caller).
+    if (!transformer_mod.qsaHistoryShareEnabled()) {
+        transformer_mod.attachQsaHistoryOnHandoff(out, ents, xf.s) catch |err| {
+            log.warn("[hot-cache] end-of-generation QSA history attach failed: {s}\n", .{@errorName(err)});
+        };
+        transformer_mod.keepOnlyLatestQsaHistory(out);
+    }
+    if (m) |mm| mm.prefix_cache_gen_end_checkpoints_total.inc();
+    log.debug("  [hot-cache] end-of-generation checkpoint at {d} ({d} generated)\n", .{ total_len, n_gen });
+    return out;
+}
+
+/// Recurrent layers from the held state; QSA layers from the live entries, whose indexer
+/// history is a prefix buffer that still reads correctly at `pos`.
+fn checkpointFromHeld(
+    a: std.mem.Allocator,
+    ents: []const SSMCacheEntry,
+    held: []const transformer_mod.SSMCacheEntrySnapshot,
+    pos: usize,
+    s: mlx.mlx_stream,
+) !transformer_mod.SSMCheckpoint {
+    if (held.len != ents.len) return error.SsmCheckpointLayerMismatch;
+    const tmp = try a.alloc(SSMCacheEntry, ents.len);
+    defer a.free(tmp);
+    for (ents, held, 0..) |*e, *h, i| {
+        tmp[i] = e.*;
+        if (transformer_mod.ssmAuxIsQsaHistory(e)) continue;
+        tmp[i].group = null;
+        tmp[i].conv_state = h.conv_state;
+        tmp[i].ssm_state = h.ssm_state;
+        tmp[i].aux_state = h.aux_state;
+        tmp[i].initialized = h.initialized;
+        tmp[i].ple_prev = h.ple_prev;
+        tmp[i].ple_prev_valid = h.ple_prev_valid;
+    }
+    return transformer_mod.captureSsmCheckpoint(a, tmp, pos, s);
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -5331,12 +5423,14 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
     const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
-    const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
+    var ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
+    // Before the QSA handoff below, so the newest checkpoint — this one — takes the history.
+    ssm_cps_opt = appendGenerationEndCheckpoint(sch.metrics, slot, gen_ptr, hc, ssm_cps_opt, total_len, n_gen);
     // qwen4_exp: the newest checkpoint takes the slot's live QSA indexer history as a view
     // of the capacity buffer (the slot is torn down right after). A failure commits the
     // entry history-less, which a QSA arch treats as a miss.
@@ -7463,6 +7557,38 @@ test "all speculative blocks publish through one per-token accounting loop" {
     const final_assign = "slot.completion_tokens = gen.completion_tokens;";
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, final_assign));
     try testing.expect(std.mem.lastIndexOf(u8, body, shared_call).? < std.mem.indexOf(u8, body, final_assign).?);
+}
+
+test "checkpointFromHeld: recurrent layers from the held step, QSA history from the live entry" {
+    const s = mlx.gpuStream();
+    const shape = [_]c_int{ 1, 4, 8 };
+    var live = [_]SSMCacheEntry{
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = mlx.mlx_array_new(), .initialized = true },
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = mlx.mlx_array_new(), .qsa_ratio = 4 },
+    };
+    defer {
+        _ = mlx.mlx_array_free(live[0].ssm_state);
+        transformer_mod.ssmFreeQsaState(&live[1]);
+    }
+    try mlx.check(mlx.mlx_zeros(&live[0].ssm_state, &shape, 3, .float32, s));
+    try mlx.check(mlx.mlx_ones(&live[1].aux_state, &[_]c_int{ 1, 16, 8 }, 3, .float32, s));
+    var held = [_]transformer_mod.SSMCacheEntrySnapshot{
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = mlx.mlx_array_new(), .initialized = true },
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true },
+    };
+    defer _ = mlx.mlx_array_free(held[0].ssm_state);
+    try mlx.check(mlx.mlx_ones(&held[0].ssm_state, &shape, 3, .float32, s));
+
+    var cp = try checkpointFromHeld(testing.allocator, &live, &held, 12, s);
+    defer cp.deinit(testing.allocator);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_sum(&sum, cp.layers[0].ssm_state, false, s));
+    try mlx.check(mlx.mlx_array_eval(sum));
+    var v: f32 = -1;
+    try mlx.check(mlx.mlx_array_item_float32(&v, sum));
+    try testing.expectEqual(@as(f32, 32), v);
+    try testing.expectEqual(@as(c_int, 12), cp.layers[1].qsa_rows);
 }
 
 test "DFlash cache payload is committed only when it spans the trunk prefix" {
