@@ -1818,6 +1818,11 @@ var vqmm_tile_cache: ?VqmmTile = null;
 /// The matmul2d tile this process dispatches (lane kill switch included).
 pub fn verifyQmmTile() VqmmTile {
     if (!naxLaneEnvEnabled()) return .off;
+    return verifyQmmHardwareTile();
+}
+
+/// The tile this machine has, whatever MLX_SERVE_VERIFY_QMM_NAX says.
+pub fn verifyQmmHardwareTile() VqmmTile {
     if (vqmm_nax_probe_override) |v| return if (v) .nax else .off;
     if (vqmm_tile_cache) |v| return v;
     var arch_buf: [128]u8 = undefined;
@@ -21541,6 +21546,9 @@ pub const Transformer = struct {
         const N: c_int = @intCast(next_tokens.len);
         std.debug.assert(next_tokens.len == ctxs.len);
         std.debug.assert(next_tokens.len == rope_offsets.len);
+        const outer_plain = plain_batched_decode;
+        plain_batched_decode = true;
+        defer plain_batched_decode = outer_plain;
         std.debug.assert(N >= 1);
         // One-shot engagement line, twin of the GDN path's. Output equality
         // alone cannot tell a batched run from N serial ones, so every guard
@@ -21885,6 +21893,9 @@ pub const Transformer = struct {
         hidden_rows: ?*?[]mlx.mlx_array,
     ) ![]mlx.mlx_array {
         if (self.config.isGlm5()) return self.forwardGlmBatchedDecode(next_tokens, ctxs, hidden_rows);
+        const outer_plain = plain_batched_decode;
+        plain_batched_decode = true;
+        defer plain_batched_decode = outer_plain;
         const N: c_int = @intCast(next_tokens.len);
         std.debug.assert(next_tokens.len == ctxs.len);
         if (!gdn_batched_logged) {
@@ -35482,6 +35493,39 @@ fn projectWithConfig(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array
     return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, s);
 }
 
+/// The verify lanes cover 2..7 rows everywhere and take 8+ only with a NAX or shader tile,
+/// so by default simd_qmm starts at 8 rows where the hardware has no tile and stays off where
+/// it has one. MLX_SERVE_SIMD_QMM_DECODE=N overrides (0 = off).
+fn simdQmmDecodeMinRows(raw: ?[*:0]const u8, tile: VqmmTile) c_int {
+    if (raw) |r| return std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch 0;
+    return if (tile == .off) 8 else 0;
+}
+
+/// Set while a plain batched decode tick (one row per slot, no drafter or MTP verify) builds
+/// its graph: the only forward simd_qmm is measured on.
+var plain_batched_decode = false;
+
+fn simdQmmDecodeTakes(min_rows: c_int, rows: c_int, plain_tick: bool) bool {
+    return plain_tick and min_rows > 0 and rows >= min_rows;
+}
+
+var simd_qmm_decode_env: ?c_int = null;
+/// Affine projections of N to simd_qmm.MAX_ROWS rows inside a plain batched decode tick go
+/// through simd_qmm; verify and draft forwards keep their lanes. N: `simdQmmDecodeMinRows`.
+fn simdQmmDecode(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    const min_rows = simd_qmm_decode_env orelse blk: {
+        const v = simdQmmDecodeMinRows(std.c.getenv("MLX_SERVE_SIMD_QMM_DECODE"), verifyQmmHardwareTile());
+        simd_qmm_decode_env = v;
+        if (v > 0) log.info("[simd_qmm] plain batched decode projections of {d}..{d} rows\n", .{ v, simd_qmm.MAX_ROWS });
+        break :blk v;
+    };
+    const xs = mlx.getShape(x);
+    var rows: c_int = 1;
+    for (xs[0 .. xs.len - 1]) |d| rows *= d;
+    if (!simdQmmDecodeTakes(min_rows, rows, plain_batched_decode)) return null;
+    return simd_qmm.qmm(x, w, sc, bi, bits, group_size, s);
+}
+
 /// Nemotron-H MoE block (mlx-lm `NemotronHMoE`): `groupLimitedRouting` over
 /// the sigmoid router, ReLU^2 routed experts (one token: in-place `gatherQmv`
 /// reads, `nemotronMoeDecodeExperts`; else the sorted gather_qmm path), the
@@ -43976,6 +44020,10 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
             s,
         ));
         return result;
+    }
+
+    if (bi.ctx != null) {
+        if (try simdQmmDecode(x, w, sc, bi, bits, group_size, s)) |y| return y;
     }
 
     // Legacy heuristic for mixed checkpoints whose config declares affine but
@@ -73604,4 +73652,32 @@ test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter,
     try testing.expectEqual(@as(usize, @intCast(R)), cache2.seqLen(0));
     std.debug.print("[glm5 mtp fixture] history + {d} single rows: min cos {d:.5}, decided misses {d}\n", .{ R - t_pre, worst, misses });
     try testing.expect(one_shot_ok and worst > 0.995 and misses == 0);
+}
+
+test "simd_qmm decode: plain batched ticks of 8+ rows where the hardware has no tile, env overrides" {
+    try testing.expectEqual(@as(c_int, 8), simdQmmDecodeMinRows(null, .off));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(null, .nax));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(null, .shader));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows("0", .off));
+    try testing.expectEqual(@as(c_int, 6), simdQmmDecodeMinRows("6", .nax));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows("x", .off));
+    // Verify and draft forwards keep their lanes at every width.
+    try testing.expect(simdQmmDecodeTakes(8, 8, true));
+    try testing.expect(simdQmmDecodeTakes(8, 16, true));
+    try testing.expect(!simdQmmDecodeTakes(8, 7, true));
+    try testing.expect(!simdQmmDecodeTakes(8, 8, false));
+    try testing.expect(!simdQmmDecodeTakes(8, 16, false));
+    try testing.expect(!simdQmmDecodeTakes(0, 16, true));
+    // MLX_SERVE_VERIFY_QMM_NAX=0 on an M5 turns the lane off, not the hardware tile.
+    const saved_env = vqmm_nax_env_cache;
+    const saved_probe = vqmm_nax_probe_override;
+    defer {
+        vqmm_nax_env_cache = saved_env;
+        vqmm_nax_probe_override = saved_probe;
+    }
+    vqmm_nax_env_cache = false;
+    vqmm_nax_probe_override = true;
+    try testing.expectEqual(VqmmTile.off, verifyQmmTile());
+    try testing.expectEqual(VqmmTile.nax, verifyQmmHardwareTile());
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(null, verifyQmmHardwareTile()));
 }
