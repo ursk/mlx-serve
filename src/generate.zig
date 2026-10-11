@@ -1267,6 +1267,46 @@ pub fn nextChunkEnd(
 /// Warm restores re-forward ≤ backoff+1 tokens.
 pub const SSM_SNAPSHOT_BACKOFF: usize = 30;
 
+/// The last two per-step SSM states of a serial decode, refcount-shared and tagged by position.
+/// The pipeline forwards the stop token and a lookahead before it stops, so the state at the
+/// reply's end survives only here.
+pub const HeldSsmRing = struct {
+    const Held = struct {
+        pos: usize = 0,
+        snaps: []transformer_mod.SSMCacheEntrySnapshot = &.{},
+        live: bool = false,
+    };
+    held: [2]Held = .{ .{}, .{} },
+
+    pub fn push(self: *HeldSsmRing, a: std.mem.Allocator, ents: []const transformer_mod.SSMCacheEntry, pos: usize) void {
+        var spare = self.held[0];
+        self.held[0] = self.held[1];
+        self.held[1] = .{};
+        if (spare.live) for (spare.snaps) |*snap| transformer_mod.ssmSnapshotDeinit(snap);
+        if (spare.snaps.len != ents.len) {
+            if (spare.snaps.len > 0) a.free(spare.snaps);
+            spare.snaps = a.alloc(transformer_mod.SSMCacheEntrySnapshot, ents.len) catch return;
+        }
+        for (ents, 0..) |*e, i| spare.snaps[i] = transformer_mod.ssmSnapshot(e);
+        spare.pos = pos;
+        spare.live = true;
+        self.held[1] = spare;
+    }
+
+    pub fn at(self: *const HeldSsmRing, pos: usize) ?[]const transformer_mod.SSMCacheEntrySnapshot {
+        for (self.held) |h| if (h.live and h.pos == pos) return h.snaps;
+        return null;
+    }
+
+    pub fn deinit(self: *HeldSsmRing, a: std.mem.Allocator) void {
+        for (&self.held) |*h| {
+            if (h.live) for (h.snaps) |*snap| transformer_mod.ssmSnapshotDeinit(snap);
+            if (h.snaps.len > 0) a.free(h.snaps);
+            h.* = .{};
+        }
+    }
+};
+
 /// How many trailing prompt tokens the final (logits) forward covers: the
 /// held-back snapshot window plus the last token itself. Pure so the
 /// backoff/loop-bound interaction is unit-testable.
@@ -1866,6 +1906,8 @@ pub const Generator = struct {
     /// allocator to free, since the layer-slice backing memory was allocated
     /// here.
     ssm_checkpoint_alloc: ?std.mem.Allocator = null,
+    held_ssm: HeldSsmRing = .{},
+    held_ssm_on: bool = false,
 
     // ── Runtime acceptance gate ──
     // Set to true mid-request when the per-request acceptance rate
@@ -3407,9 +3449,10 @@ pub const Generator = struct {
         // doesn't double-free. All four init paths below call this once
         // before returning their Generator.
         const attachCp = struct {
-            fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), a: std.mem.Allocator) void {
+            fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), a: std.mem.Allocator, hold: bool) void {
                 g.ssm_checkpoints = list.*;
                 g.ssm_checkpoint_alloc = a;
+                g.held_ssm_on = hold and g.ctx.ssm_entries != null;
                 list.* = std.ArrayList(SSMCheckpoint).empty;
             }
         }.f;
@@ -3452,7 +3495,7 @@ pub const Generator = struct {
             };
             gen.pending_logits = logits;
             gen.has_pending_logits = true;
-            attachCp(&gen, &ssm_checkpoints, allocator);
+            attachCp(&gen, &ssm_checkpoints, allocator, want_ssm_cp);
             return gen;
         }
 
@@ -3542,7 +3585,7 @@ pub const Generator = struct {
             // pending_logits/pending_token left empty — the lazy pipeline is
             // skipped under PLD / drafter / MTP. The speculative `next*` paths
             // drive every subsequent step with predictable cache offset.
-            attachCp(&gen, &ssm_checkpoints, allocator);
+            attachCp(&gen, &ssm_checkpoints, allocator, want_ssm_cp);
             return gen;
         }
 
@@ -3591,7 +3634,7 @@ pub const Generator = struct {
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
             };
-            attachCp(&gen, &ssm_checkpoints, allocator);
+            attachCp(&gen, &ssm_checkpoints, allocator, want_ssm_cp);
             return gen;
         }
 
@@ -3652,7 +3695,7 @@ pub const Generator = struct {
         gen.pending_logits = next_logits;
         gen.has_pending_logits = true;
 
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, allocator, want_ssm_cp);
         return gen;
     }
 
@@ -3897,6 +3940,7 @@ pub const Generator = struct {
         // was allocated by `ssm_checkpoint_alloc` (= the allocator passed to
         // `initWithOptions`), so we use that one. The ArrayList itself was
         // also created with that allocator.
+        if (self.ssm_checkpoint_alloc) |a| self.held_ssm.deinit(a);
         if (self.ssm_checkpoint_alloc) |a| {
             for (self.ssm_checkpoints.items) |*cp| cp.deinit(a);
             self.ssm_checkpoints.deinit(a);
@@ -3910,6 +3954,20 @@ pub const Generator = struct {
             self.ssm_checkpoints = std.ArrayList(SSMCheckpoint).empty;
         }
         self.generated_ids.deinit(allocator);
+    }
+
+    /// Refcount-share the live SSM state before a serial decode forward (see `held_ssm`).
+    /// A no-op in a batched group, whose states are rows of merged arrays.
+    fn holdSsmBeforeForward(self: *Generator) void {
+        if (!self.held_ssm_on) return;
+        // Speculative arms forward drafts that a rollback can take back; a held state could
+        // then name a position the request never kept.
+        if (self.pld_enabled or self.dspark_enabled or self.drafter != null or self.dflash != null or
+            self.mtp != null or self.mtp_cache != null) return;
+        const ents = self.ctx.ssm_entries orelse return;
+        for (ents) |*e| if (e.group) |g| if (g.live) return;
+        const a = self.ssm_checkpoint_alloc orelse return;
+        self.held_ssm.push(a, ents, self.ctx.moe_seq_offset.*);
     }
 
     /// Transfer ownership of accumulated SSM checkpoints to the caller.
@@ -12280,6 +12338,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
+            self.holdSsmBeforeForward();
             self.pending_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             self.has_pending_logits = true;
         }
@@ -12299,6 +12358,7 @@ pub const Generator = struct {
             defer if (!adopted) {
                 _ = mlx.mlx_array_free(lazy_token);
             };
+            self.holdSsmBeforeForward();
             if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
                 defer if (!adopted) {
                     _ = mlx.mlx_array_free(next_logits);
@@ -12361,6 +12421,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
+            self.holdSsmBeforeForward();
             break :blk try self.xfm.forwardWith(&self.ctx, tok_input);
         };
 
@@ -12384,6 +12445,7 @@ pub const Generator = struct {
         _ = mlx.mlx_array_free(step_logits);
 
         if (self.step < self.max_tokens) {
+            self.holdSsmBeforeForward();
             const next_logits = lazyForward(self.xfm, &self.ctx, lazy_token) catch {
                 try mlx.check(mlx.mlx_array_eval(lazy_token));
                 var val: i32 = 0;
@@ -12531,6 +12593,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
+            self.holdSsmBeforeForward();
             const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{next_logits};
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
@@ -12639,6 +12702,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
+            self.holdSsmBeforeForward();
             const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{next_logits};
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
@@ -12726,6 +12790,7 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(lazy);
         var next_logits: ?mlx.mlx_array = null;
         if (self.step + 1 < self.max_tokens) {
+            self.holdSsmBeforeForward();
             if (lazyForward(self.xfm, &self.ctx, lazy)) |nl| {
                 const arr = [_]mlx.mlx_array{ lazy, nl };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
@@ -12793,6 +12858,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
+            self.holdSsmBeforeForward();
             const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{nl};
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
@@ -12835,6 +12901,7 @@ pub const Generator = struct {
         const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(tok_input);
 
+        self.holdSsmBeforeForward();
         const logits = self.xfm.forwardWith(&self.ctx, tok_input) catch return;
         const arr = [_]mlx.mlx_array{logits};
         const vec = mlx.mlx_vector_array_new_data(&arr, 1);
